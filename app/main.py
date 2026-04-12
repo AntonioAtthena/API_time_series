@@ -11,27 +11,59 @@ On startup, SQLAlchemy creates all tables automatically — no migration tool
 or database server needed. A local financial.db file is created on first run.
 """
 
+import json
+import pathlib
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import Base, engine, get_db
+from app.database import AsyncSessionLocal, Base, engine, get_db
 from app.models import Datapoint
 from app.routers import datapoints, upload
-from app.schemas import DatapointResponse, InfoResponse
+from app.schemas import DatapointResponse, InfoResponse, RawDatapoint
+from app.services.ingest import ingest_datapoints
+
+
+async def _auto_seed() -> None:
+    """Seed the database from time_series.json on first startup (when DB is empty)."""
+    async with AsyncSessionLocal() as db:
+        count = (await db.execute(select(func.count(Datapoint.id)))).scalar_one()
+        if count > 0:
+            return  # Already seeded — skip
+
+        seed_file = pathlib.Path("time_series.json")
+        if not seed_file.exists():
+            return  # No seed file found — skip silently
+
+        raw = json.loads(seed_file.read_bytes().decode("utf-8-sig"))
+        if not isinstance(raw, list) or not raw:
+            return
+
+        validated: list[RawDatapoint] = []
+        for item in raw:
+            try:
+                validated.append(RawDatapoint.model_validate(item))
+            except ValidationError:
+                pass
+
+        if validated:
+            result = await ingest_datapoints(validated, db, seed_file.name)
+            print(f"==> Auto-seeded {result.inserted} rows from {seed_file.name}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Create tables on startup; dispose connection pool on shutdown."""
+    """Create tables on startup; seed DB if empty; dispose connection pool on shutdown."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await _auto_seed()
     yield
     await engine.dispose()
 
