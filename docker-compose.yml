@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: financial
+      POSTGRES_PASSWORD: financial
+      POSTGRES_DB: financial_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"          # optional: exposed so you can inspect with pgAdmin
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U financial -d financial_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://financial:financial@db:5432/financial_db
+      # Change this key before exposing to any network.
+      # Generate a new one: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      API_KEYS: dev-api-key-change-me
+      ENV: development
+    depends_on:
+      db:
+        condition: service_healthy
+    # Restart on crash (e.g. if DB wasn't ready on first attempt)
+    restart: on-failure
+
+volumes:
+  pgdata:
+    driver: local
