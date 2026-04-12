@@ -232,6 +232,28 @@ class MetricSummary(BaseModel):
     data_point_count: int
 
 
+# ── Single-point response ─────────────────────────────────────────────────────
+
+class ValorPontoResponse(BaseModel):
+    """Valor único de uma métrica para um período e escopo específicos.
+
+    Retornado por GET /api/v1/serie/{metric_id}/ponto.
+    Útil para consultas pontuais sem precisar percorrer uma série inteira.
+    """
+
+    metric_id: str
+    metric_name: str | None
+    escopo: str
+    periodo: str
+    tipo_periodo_en: str | None
+    tipo_periodo: str | None
+    data: str          # dd/MM/yyyy — convenção BCB/CVM
+    data_iso: date
+    valor: float
+    moeda: str = "BRL"
+    escala_monetaria: str
+
+
 # ── Upload response ────────────────────────────────────────────────────────────
 
 class UploadResponse(BaseModel):

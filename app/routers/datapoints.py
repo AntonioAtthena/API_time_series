@@ -34,6 +34,7 @@ from app.schemas import (
     PaginatedResponse,
     SerieItem,
     SerieResponse,
+    ValorPontoResponse,
 )
 from app.schemas import _ESCALA_MAP, _TIPO_PERIODO_PT
 
@@ -55,6 +56,7 @@ def _apply_filters(
     filing: str | None,
     period_from: date | None,
     period_to: date | None,
+    periodo: str | None = None,
 ):
     """Apply optional WHERE clauses to a SQLAlchemy select statement."""
     if metric_id is not None:
@@ -69,6 +71,8 @@ def _apply_filters(
         query = query.where(Datapoint.period_start >= period_from)
     if period_to is not None:
         query = query.where(Datapoint.period_end <= period_to)
+    if periodo is not None:
+        query = query.where(Datapoint.period == periodo)
     return query
 
 
@@ -215,9 +219,10 @@ async def list_filings(db: AsyncSession = Depends(get_db)) -> list[str]:
     response_model=SerieResponse,
     summary="Série temporal de uma métrica (estilo BCB SGS)",
     description=(
-        "Retorna a série temporal completa de uma métrica no formato BCB SGS: "
+        "Retorna a série temporal de uma métrica no formato BCB SGS: "
         "`{data: 'DD/MM/YYYY', valor: float}`. "
         "Filtros opcionais: **escopo** (consolidado|controladora), "
+        "**periodo** (tag bruta, ex: '12M23'), "
         "**data_inicio** e **data_fim** nos formatos ISO ou DD/MM/AAAA."
     ),
 )
@@ -226,6 +231,10 @@ async def get_serie(
     escopo: str | None = Query(
         None,
         description="Escopo da entidade: 'consolidado' ou 'controladora'.",
+    ),
+    periodo: str | None = Query(
+        None,
+        description="Tag de período exata, ex: '12M23', '1T24'. Case-insensitive não aplicado — use exatamente como cadastrado.",
     ),
     data_inicio: str | None = Query(
         None,
@@ -247,6 +256,7 @@ async def get_serie(
         metric_id=metric_id, entity_scope=escopo,
         period_type=None, filing=None,
         period_from=period_from, period_to=period_to,
+        periodo=periodo,
     ).order_by(Datapoint.period_end, Datapoint.entity_scope)
 
     rows = (await db.execute(q)).scalars().all()
@@ -284,6 +294,92 @@ async def get_serie(
     )
 
 
+# ── GET /serie/{metric_id}/ponto  —  valor único ──────────────────────────────
+# Consulta pontual: métrica + período específico + escopo obrigatório.
+# Retorna exatamente um valor ou 404.
+
+@router.get(
+    "/serie/{metric_id}/ponto",
+    response_model=ValorPontoResponse,
+    summary="Valor único de uma métrica em um período e escopo específicos",
+    description=(
+        "Retorna **um único valor** para a combinação métrica + período + escopo. "
+        "Útil para consultas pontuais sem percorrer a série inteira. \n\n"
+        "**Parâmetros obrigatórios:** `escopo` e (`periodo` ou `data_referencia`). \n\n"
+        "- `escopo`: `'consolidado'` ou `'controladora'` \n"
+        "- `periodo`: tag bruta exata, ex: `'12M23'`, `'1T24'` \n"
+        "- `data_referencia`: data de encerramento do período — ISO (AAAA-MM-DD) "
+        "ou brasileiro (DD/MM/AAAA). Usado quando a tag de período não é conhecida."
+    ),
+)
+async def get_ponto(
+    metric_id: str = Path(description="Identificador da métrica, ex: 'receita_liquida'."),
+    escopo: str = Query(
+        description="Escopo obrigatório: 'consolidado' ou 'controladora'.",
+    ),
+    periodo: str | None = Query(
+        None,
+        description="Tag de período exata, ex: '12M23', '3T22'.",
+    ),
+    data_referencia: str | None = Query(
+        None,
+        description=(
+            "Data de encerramento do período — ISO (AAAA-MM-DD) ou DD/MM/AAAA. "
+            "Alternativa ao parâmetro `periodo`."
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> ValorPontoResponse:
+    if periodo is None and data_referencia is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe ao menos um dos parâmetros: 'periodo' ou 'data_referencia'.",
+        )
+
+    data_ref = _parse_br_date(data_referencia)
+
+    q = select(Datapoint).where(
+        Datapoint.metric_id == metric_id,
+        Datapoint.entity_scope == escopo,
+    )
+    if periodo is not None:
+        q = q.where(Datapoint.period == periodo)
+    if data_ref is not None:
+        q = q.where(Datapoint.period_end == data_ref)
+
+    # Se ambos foram fornecidos, o WHERE já combina os dois filtros.
+    # Ordena por period_end desc para retornar o mais recente quando houver
+    # múltiplos arquivos com o mesmo (métrica, período, escopo).
+    q = q.order_by(Datapoint.period_end.desc(), Datapoint.updated_at.desc()).limit(1)
+
+    row = (await db.execute(q)).scalars().first()
+
+    if row is None:
+        detail = (
+            f"Nenhum dado encontrado para métrica='{metric_id}', "
+            f"escopo='{escopo}'"
+        )
+        if periodo:
+            detail += f", periodo='{periodo}'"
+        if data_referencia:
+            detail += f", data_referencia='{data_referencia}'"
+        detail += "."
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+    return ValorPontoResponse(
+        metric_id=row.metric_id,
+        metric_name=row.metric_name,
+        escopo=row.entity_scope,
+        periodo=row.period,
+        tipo_periodo_en=row.period_type,
+        tipo_periodo=_TIPO_PERIODO_PT.get(row.period_type or "", None),
+        data=row.period_end.strftime("%d/%m/%Y"),
+        data_iso=row.period_end,
+        valor=float(row.value),
+        escala_monetaria=_ESCALA_MAP.get(row.scale_power, f"10^{row.scale_power}"),
+    )
+
+
 # ── Portuguese aliases ────────────────────────────────────────────────────────
 # Mirrors CVM Portal Dados Abertos naming conventions.
 # Accepts Brazilian date format (DD/MM/AAAA) in addition to ISO.
@@ -302,6 +398,7 @@ async def get_serie(
 async def get_dados(
     metric_id: str | None = Query(None, description="Identificador da métrica."),
     escopo: str | None = Query(None, description="'consolidado' ou 'controladora'."),
+    periodo: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
     tipo_periodo: str | None = Query(None, description="'full_year', 'quarter' ou 'year_to_date'."),
     demonstracao: str | None = Query(None, description="Ex: 'DFP 2020 Ann'."),
     data_inicio: str | None = Query(None, description="Data inicial (AAAA-MM-DD ou DD/MM/AAAA)."),
@@ -318,6 +415,7 @@ async def get_dados(
         metric_id=metric_id, entity_scope=escopo,
         period_type=tipo_periodo, filing=demonstracao,
         period_from=period_from, period_to=period_to,
+        periodo=periodo,
     )
     total: int = (await db.execute(select(func.count()).select_from(base_q.subquery()))).scalar_one()
     rows = (await db.execute(

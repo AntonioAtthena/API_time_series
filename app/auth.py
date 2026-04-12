@@ -17,7 +17,7 @@ Security properties:
 
 import secrets
 
-from fastapi import HTTPException, Security, status
+from fastapi import HTTPException, Query, Security, status
 from fastapi.security import APIKeyHeader
 
 from app.config import settings
@@ -26,34 +26,29 @@ from app.config import settings
 _API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def require_api_key(api_key: str | None = Security(_API_KEY_HEADER)) -> str:
-    """FastAPI dependency that validates the X-API-Key request header.
+async def require_api_key(
+    header_key: str | None = Security(_API_KEY_HEADER),
+    api_key: str | None = Query(None, alias="api_key", include_in_schema=False),
+) -> str:
+    """Valida a chave de API recebida via header X-API-Key ou query param ?api_key=.
 
-    Args:
-        api_key: Value extracted from the 'X-API-Key' header by FastAPI's
-            security scheme (None if the header is absent).
-
-    Returns:
-        The validated API key string (useful if downstream code needs it).
-
-    Raises:
-        HTTPException: 401 if the key is missing or not in the allowed set.
+    O header tem prioridade. O query param permite colar a URL direto no navegador.
     """
-    if api_key is None:
+    candidate = header_key or api_key
+
+    if candidate is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing X-API-Key header.",
+            detail="Chave de API ausente. Envie via header 'X-API-Key' ou parâmetro '?api_key='.",
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    # Use constant-time comparison for every configured key.
-    # secrets.compare_digest prevents timing-based key enumeration.
     for valid_key in settings.api_keys:
-        if secrets.compare_digest(api_key, valid_key):
-            return api_key
+        if secrets.compare_digest(candidate, valid_key):
+            return candidate
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid API key.",
+        detail="Chave de API inválida.",
         headers={"WWW-Authenticate": "ApiKey"},
     )
