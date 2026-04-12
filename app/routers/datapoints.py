@@ -30,7 +30,6 @@ All endpoints that accept metric_id support comma-separated batch values:
 import csv
 import io
 from collections import defaultdict
-from datetime import date, datetime
 from math import ceil
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
@@ -40,6 +39,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_api_key
 from app.database import get_db
+from app.excel import (
+    build_datapoints_xlsx,
+    build_serie_xlsx,
+    build_series_xlsx,
+    make_zip_response,
+)
 from app.models import Datapoint
 from app.schemas import (
     DatapointResponse,
@@ -77,10 +82,7 @@ def _apply_filters(
     metric_ids: list[str] | None,
     entity_scope: str | None,
     period_type: str | None,
-    filing: str | None,
-    period_from: date | None,
-    period_to: date | None,
-    periodo: str | None = None,
+    period: str | None = None,
 ):
     """Apply optional WHERE clauses to a SQLAlchemy select statement.
 
@@ -95,36 +97,10 @@ def _apply_filters(
         query = query.where(Datapoint.entity_scope == entity_scope)
     if period_type is not None:
         query = query.where(Datapoint.period_type == period_type)
-    if filing is not None:
-        query = query.where(Datapoint.filing == filing)
-    if period_from is not None:
-        query = query.where(Datapoint.period_start >= period_from)
-    if period_to is not None:
-        query = query.where(Datapoint.period_end <= period_to)
-    if periodo is not None:
-        query = query.where(Datapoint.period == periodo)
+    if period is not None:
+        query = query.where(Datapoint.period == period)
     return query
 
-
-def _parse_br_date(value: str | None) -> date | None:
-    """Accept ISO (YYYY-MM-DD) or Brazilian (DD/MM/YYYY) date strings.
-
-    Returns None if value is None. Raises HTTPException 422 on bad format.
-    """
-    if value is None:
-        return None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(value, fmt).date()
-        except ValueError:
-            continue
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail=(
-            f"Data inválida: '{value}'. "
-            "Use o formato ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA)."
-        ),
-    )
 
 
 def _to_csv_response(rows: list[dict], filename: str) -> StreamingResponse:
@@ -158,9 +134,7 @@ async def get_datapoints(
     metric_id: str | None = Query(None, description="Identificador(es) da métrica — separe por vírgula para múltiplas: 'baixa_imobilizado,contingencias'."),
     entity_scope: str | None = Query(None, description="Escopo da entidade: 'consolidado' ou 'controladora'."),
     period_type: str | None = Query(None, description="Tipo de período: 'full_year', 'quarter' ou 'year_to_date'."),
-    filing: str | None = Query(None, description="Referência do demonstrativo, ex: 'DFP 2020 Ann'."),
-    period_from: date | None = Query(None, description="period_start >= esta data (formato ISO YYYY-MM-DD)."),
-    period_to: date | None = Query(None, description="period_end <= esta data (formato ISO YYYY-MM-DD)."),
+    period: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
     page: int = Query(1, ge=1, description="Número da página (base 1)."),
     page_size: int = Query(100, ge=1, le=1000, description="Linhas por página (máx 1 000)."),
     db: AsyncSession = Depends(get_db),
@@ -168,8 +142,7 @@ async def get_datapoints(
     base_q = _apply_filters(
         select(Datapoint),
         metric_ids=_parse_metric_ids(metric_id), entity_scope=entity_scope,
-        period_type=period_type, filing=filing,
-        period_from=period_from, period_to=period_to,
+        period_type=period_type, period=period,
     )
     total: int = (await db.execute(select(func.count()).select_from(base_q.subquery()))).scalar_one()
     rows = (await db.execute(
@@ -192,26 +165,27 @@ async def get_datapoints(
     description=(
         "Retorna os dados como array JSON simples, sem envelope de paginação. "
         "**metric_id** aceita múltiplos valores separados por vírgula: `?metric_id=a,b,c`. "
-        "Use **?format=csv** para receber como planilha CSV para download direto. "
+        "Use **?format=csv** para download direto como CSV. "
+        "Use **?format=xlsx** para download de um ZIP contendo CSV + planilha Excel com gráficos. "
         "Limitado a 10 000 linhas."
     ),
-    responses={200: {"content": {"text/csv": {"schema": {"type": "string"}}}}},
+    responses={200: {"content": {
+        "text/csv": {"schema": {"type": "string"}},
+        "application/zip": {"schema": {"type": "string", "format": "binary"}},
+    }}},
 )
 async def get_datapoints_flat(
     metric_id: str | None = Query(None, description="Identificador(es) da métrica — separe por vírgula para múltiplas."),
-    entity_scope: str | None = Query(None),
-    period_type: str | None = Query(None),
-    filing: str | None = Query(None),
-    period_from: date | None = Query(None),
-    period_to: date | None = Query(None),
-    format: str | None = Query(None, description="Formato de saída: 'csv' para download como planilha."),
+    entity_scope: str | None = Query(None, description="Escopo da entidade: 'consolidado' ou 'controladora'."),
+    period_type: str | None = Query(None, description="Tipo de período: 'full_year', 'quarter' ou 'year_to_date'."),
+    period: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
+    format: str | None = Query(None, description="Formato de saída: 'csv' → CSV puro; 'xlsx' → ZIP com CSV + Excel (gráficos)."),
     db: AsyncSession = Depends(get_db),
 ):
     q = _apply_filters(
         select(Datapoint),
         metric_ids=_parse_metric_ids(metric_id), entity_scope=entity_scope,
-        period_type=period_type, filing=filing,
-        period_from=period_from, period_to=period_to,
+        period_type=period_type, period=period,
     ).order_by(Datapoint.period_start, Datapoint.metric_id).limit(10_000)
     rows = (await db.execute(q)).scalars().all()
     data = [DatapointResponse.model_validate(r) for r in rows]
@@ -221,6 +195,12 @@ async def get_datapoints_flat(
             [d.model_dump() for d in data],
             filename="datapoints.csv",
         )
+
+    if format == "xlsx":
+        dicts = [d.model_dump() for d in data]
+        xlsx_bytes = build_datapoints_xlsx(dicts)
+        return make_zip_response(dicts, xlsx_bytes, base_filename="datapoints")
+
     return data
 
 
@@ -277,45 +257,29 @@ async def list_filings(db: AsyncSession = Depends(get_db)) -> list[str]:
     description=(
         "Retorna a série temporal de uma métrica no formato BCB SGS: "
         "`{data: 'DD/MM/YYYY', valor: float}`. "
-        "Filtros opcionais: **escopo** (consolidado|controladora), "
-        "**periodo** (tag bruta, ex: '12M23'), "
-        "**data_inicio** e **data_fim** nos formatos ISO ou DD/MM/AAAA. "
-        "Use **?format=csv** para download como planilha."
+        "Filtros opcionais: **entity_scope** (consolidado|controladora), "
+        "**period_type** (full_year|quarter|year_to_date), "
+        "**period** (tag bruta, ex: '12M23', '1T24'). "
+        "Use **?format=csv** para download como CSV. "
+        "Use **?format=xlsx** para download de um ZIP com CSV + planilha Excel com gráfico."
     ),
-    responses={200: {"content": {"text/csv": {"schema": {"type": "string"}}}}},
+    responses={200: {"content": {
+        "text/csv": {"schema": {"type": "string"}},
+        "application/zip": {"schema": {"type": "string", "format": "binary"}},
+    }}},
 )
 async def get_serie(
     metric_id: str = Path(description="Identificador da métrica, ex: 'baixa_imobilizado'."),
-    escopo: str | None = Query(
-        None,
-        description="Escopo da entidade: 'consolidado' ou 'controladora'.",
-    ),
-    periodo: str | None = Query(
-        None,
-        description="Tag de período exata, ex: '12M23', '1T24'. Case-insensitive não aplicado — use exatamente como cadastrado.",
-    ),
-    data_inicio: str | None = Query(
-        None,
-        description="Data inicial — ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA).",
-        examples="01/01/2019",
-    ),
-    data_fim: str | None = Query(
-        None,
-        description="Data final — ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA).",
-        examples="31/12/2024",
-    ),
-    format: str | None = Query(None, description="Formato de saída: 'csv' para download como planilha."),
+    entity_scope: str | None = Query(None, description="Escopo da entidade: 'consolidado' ou 'controladora'."),
+    period_type: str | None = Query(None, description="Tipo de período: 'full_year', 'quarter' ou 'year_to_date'."),
+    period: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
+    format: str | None = Query(None, description="Formato de saída: 'csv' → CSV puro; 'xlsx' → ZIP com CSV + Excel (gráfico)."),
     db: AsyncSession = Depends(get_db),
 ):
-    period_from = _parse_br_date(data_inicio)
-    period_to = _parse_br_date(data_fim)
-
     q = _apply_filters(
         select(Datapoint),
-        metric_ids=[metric_id], entity_scope=escopo,
-        period_type=None, filing=None,
-        period_from=period_from, period_to=period_to,
-        periodo=periodo,
+        metric_ids=[metric_id], entity_scope=entity_scope,
+        period_type=period_type, period=period,
     ).order_by(Datapoint.period_end, Datapoint.entity_scope)
 
     rows = (await db.execute(q)).scalars().all()
@@ -326,13 +290,12 @@ async def get_serie(
             detail=f"Nenhum dado encontrado para a métrica '{metric_id}'.",
         )
 
-    # Derive escala_monetaria from the first row (all rows share the same scale)
     escala = _ESCALA_MAP.get(rows[0].scale_power, f"10^{rows[0].scale_power}")
     metric_name = rows[0].metric_name
 
     dados = [
         SerieItem(
-            data=row.period_end.strftime("%d/%m/%Y"),   # BCB/CVM: DD/MM/YYYY
+            data=row.period_end.strftime("%d/%m/%Y"),
             data_iso=row.period_end,
             valor=float(row.value),
             periodo=row.period,
@@ -343,7 +306,7 @@ async def get_serie(
         for row in rows
     ]
 
-    if format == "csv":
+    if format in ("csv", "xlsx"):
         csv_rows = [
             {
                 "metric_id": metric_id,
@@ -359,7 +322,11 @@ async def get_serie(
             }
             for item in dados
         ]
-        return _to_csv_response(csv_rows, filename=f"serie_{metric_id}.csv")
+        if format == "csv":
+            return _to_csv_response(csv_rows, filename=f"serie_{metric_id}.csv")
+
+        xlsx_bytes = build_serie_xlsx(csv_rows, metric_id, metric_name, escala)
+        return make_zip_response(csv_rows, xlsx_bytes, base_filename=f"serie_{metric_id}")
 
     return SerieResponse(
         metric_id=metric_id,
@@ -385,10 +352,13 @@ async def get_serie(
         "Passe os identificadores separados por vírgula em **metric_id**: "
         "`?metric_id=baixa_ativos,contingencias,total`. "
         "Aceita os mesmos filtros de `/serie/{metric_id}`. "
-        "Use **?format=csv** para download de todas as séries em uma planilha única, "
-        "com coluna `metric_id` para diferenciar cada série."
+        "Use **?format=csv** para download de todas as séries em um CSV único. "
+        "Use **?format=xlsx** para download de um ZIP com CSV + planilha Excel com uma aba e gráfico por métrica."
     ),
-    responses={200: {"content": {"text/csv": {"schema": {"type": "string"}}}}},
+    responses={200: {"content": {
+        "text/csv": {"schema": {"type": "string"}},
+        "application/zip": {"schema": {"type": "string", "format": "binary"}},
+    }}},
 )
 async def get_series_batch(
     metric_id: str = Query(
@@ -397,11 +367,10 @@ async def get_series_batch(
             "Ex: `baixa_ativos,contingencias,total`."
         )
     ),
-    escopo: str | None = Query(None, description="Escopo da entidade: 'consolidado' ou 'controladora'."),
-    periodo: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
-    data_inicio: str | None = Query(None, description="Data inicial — ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA)."),
-    data_fim: str | None = Query(None, description="Data final — ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA)."),
-    format: str | None = Query(None, description="Formato de saída: 'csv' para planilha consolidada."),
+    entity_scope: str | None = Query(None, description="Escopo da entidade: 'consolidado' ou 'controladora'."),
+    period_type: str | None = Query(None, description="Tipo de período: 'full_year', 'quarter' ou 'year_to_date'."),
+    period: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
+    format: str | None = Query(None, description="Formato de saída: 'csv' → CSV único; 'xlsx' → ZIP com CSV + Excel (aba por métrica)."),
     db: AsyncSession = Depends(get_db),
 ):
     metric_ids = _parse_metric_ids(metric_id)
@@ -411,15 +380,10 @@ async def get_series_batch(
             detail="Informe ao menos um metric_id.",
         )
 
-    period_from = _parse_br_date(data_inicio)
-    period_to = _parse_br_date(data_fim)
-
     q = _apply_filters(
         select(Datapoint),
-        metric_ids=metric_ids, entity_scope=escopo,
-        period_type=None, filing=None,
-        period_from=period_from, period_to=period_to,
-        periodo=periodo,
+        metric_ids=metric_ids, entity_scope=entity_scope,
+        period_type=period_type, period=period,
     ).order_by(Datapoint.metric_id, Datapoint.period_end, Datapoint.entity_scope)
 
     rows = (await db.execute(q)).scalars().all()
@@ -430,13 +394,13 @@ async def get_series_batch(
             detail=f"Nenhum dado encontrado para as métricas: {', '.join(metric_ids)}.",
         )
 
-    # Group by metric_id preserving request order
     grouped: dict[str, list] = defaultdict(list)
     for row in rows:
         grouped[row.metric_id].append(row)
 
     result: list[SerieResponse] = []
     csv_rows: list[dict] = []
+    series_data: list[dict] = []   # para build_series_xlsx
 
     for mid in metric_ids:
         metric_rows = grouped.get(mid)
@@ -468,9 +432,9 @@ async def get_series_batch(
             dados=dados,
         ))
 
-        if format == "csv":
-            for item in dados:
-                csv_rows.append({
+        if format in ("csv", "xlsx"):
+            metric_csv: list[dict] = [
+                {
                     "metric_id": mid,
                     "metric_name": metric_name,
                     "data_iso": item.data_iso,
@@ -481,13 +445,28 @@ async def get_series_batch(
                     "entidade": item.entidade,
                     "moeda": "BRL",
                     "escala_monetaria": escala,
+                }
+                for item in dados
+            ]
+            csv_rows.extend(metric_csv)
+            if format == "xlsx":
+                series_data.append({
+                    "metric_id": mid,
+                    "metric_name": metric_name,
+                    "escala": escala,
+                    "rows": metric_csv,
                 })
 
+    slug = "_".join(metric_ids[:3])
+    if len(metric_ids) > 3:
+        slug += f"_e_mais_{len(metric_ids) - 3}"
+
     if format == "csv":
-        slug = "_".join(metric_ids[:3])
-        if len(metric_ids) > 3:
-            slug += f"_e_mais_{len(metric_ids) - 3}"
         return _to_csv_response(csv_rows, filename=f"series_{slug}.csv")
+
+    if format == "xlsx":
+        xlsx_bytes = build_series_xlsx(series_data)
+        return make_zip_response(csv_rows, xlsx_bytes, base_filename=f"series_{slug}")
 
     return result
 
@@ -503,49 +482,29 @@ async def get_series_batch(
     description=(
         "Retorna **um único valor** para a combinação métrica + período + escopo. "
         "Útil para consultas pontuais sem percorrer a série inteira. \n\n"
-        "**Parâmetros obrigatórios:** `escopo` e (`periodo` ou `data_referencia`). \n\n"
-        "- `escopo`: `'consolidado'` ou `'controladora'` \n"
-        "- `periodo`: tag bruta exata, ex: `'12M23'`, `'1T24'` \n"
-        "- `data_referencia`: data de encerramento do período — ISO (AAAA-MM-DD) "
-        "ou brasileiro (DD/MM/AAAA). Usado quando a tag de período não é conhecida."
+        "**Parâmetros obrigatórios:** `entity_scope` e `period`. \n\n"
+        "- `entity_scope`: `'consolidado'` ou `'controladora'` \n"
+        "- `period`: tag bruta exata, ex: `'12M23'`, `'1T24'`"
     ),
 )
 async def get_ponto(
     metric_id: str = Path(description="Identificador da métrica, ex: 'receita_liquida'."),
-    escopo: str = Query(
-        description="Escopo obrigatório: 'consolidado' ou 'controladora'.",
-    ),
-    periodo: str | None = Query(
-        None,
-        description="Tag de período exata, ex: '12M23', '3T22'.",
-    ),
-    data_referencia: str | None = Query(
-        None,
-        description=(
-            "Data de encerramento do período — ISO (AAAA-MM-DD) ou DD/MM/AAAA. "
-            "Alternativa ao parâmetro `periodo`."
-        ),
-    ),
+    entity_scope: str = Query(description="Escopo obrigatório: 'consolidado' ou 'controladora'."),
+    period: str | None = Query(None, description="Tag de período exata, ex: '12M23', '3T22'."),
     db: AsyncSession = Depends(get_db),
 ) -> ValorPontoResponse:
-    if periodo is None and data_referencia is None:
+    if period is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Informe ao menos um dos parâmetros: 'periodo' ou 'data_referencia'.",
+            detail="Informe o parâmetro 'period'.",
         )
-
-    data_ref = _parse_br_date(data_referencia)
 
     q = select(Datapoint).where(
         Datapoint.metric_id == metric_id,
-        Datapoint.entity_scope == escopo,
+        Datapoint.entity_scope == entity_scope,
+        Datapoint.period == period,
     )
-    if periodo is not None:
-        q = q.where(Datapoint.period == periodo)
-    if data_ref is not None:
-        q = q.where(Datapoint.period_end == data_ref)
 
-    # Se ambos foram fornecidos, o WHERE já combina os dois filtros.
     # Ordena por period_end desc para retornar o mais recente quando houver
     # múltiplos arquivos com o mesmo (métrica, período, escopo).
     q = q.order_by(Datapoint.period_end.desc(), Datapoint.updated_at.desc()).limit(1)
@@ -553,16 +512,13 @@ async def get_ponto(
     row = (await db.execute(q)).scalars().first()
 
     if row is None:
-        detail = (
-            f"Nenhum dado encontrado para métrica='{metric_id}', "
-            f"escopo='{escopo}'"
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Nenhum dado encontrado para métrica='{metric_id}', "
+                f"entity_scope='{entity_scope}', period='{period}'."
+            ),
         )
-        if periodo:
-            detail += f", periodo='{periodo}'"
-        if data_referencia:
-            detail += f", data_referencia='{data_referencia}'"
-        detail += "."
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
 
     return ValorPontoResponse(
         metric_id=row.metric_id,
@@ -580,7 +536,6 @@ async def get_ponto(
 
 # ── Portuguese aliases ────────────────────────────────────────────────────────
 # Mirrors CVM Portal Dados Abertos naming conventions.
-# Accepts Brazilian date format (DD/MM/AAAA) in addition to ISO.
 
 @router.get(
     "/dados",
@@ -588,10 +543,9 @@ async def get_ponto(
     summary="Consultar dados (parâmetros em português)",
     description=(
         "Alias português para **/datapoints**. "
-        "Aceita datas em formato brasileiro (DD/MM/AAAA) além do ISO. "
         "**metric_id** aceita múltiplos valores separados por vírgula: `?metric_id=a,b,c`. "
-        "Use **escopo** em vez de *entity_scope*, **data_inicio**/**data_fim** "
-        "em vez de *period_from*/*period_to*."
+        "Use **escopo** em vez de *entity_scope*, **tipo_periodo** em vez de *period_type*, "
+        "**periodo** em vez de *period*."
     ),
 )
 async def get_dados(
@@ -599,22 +553,14 @@ async def get_dados(
     escopo: str | None = Query(None, description="'consolidado' ou 'controladora'."),
     periodo: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
     tipo_periodo: str | None = Query(None, description="'full_year', 'quarter' ou 'year_to_date'."),
-    demonstracao: str | None = Query(None, description="Ex: 'DFP 2020 Ann'."),
-    data_inicio: str | None = Query(None, description="Data inicial (AAAA-MM-DD ou DD/MM/AAAA)."),
-    data_fim: str | None = Query(None, description="Data final (AAAA-MM-DD ou DD/MM/AAAA)."),
     pagina: int = Query(1, ge=1, alias="pagina", description="Número da página (base 1)."),
     tamanho_pagina: int = Query(100, ge=1, le=1000, description="Linhas por página (máx 1 000)."),
     db: AsyncSession = Depends(get_db),
 ) -> PaginatedResponse[DatapointResponse]:
-    period_from = _parse_br_date(data_inicio)
-    period_to = _parse_br_date(data_fim)
-
     base_q = _apply_filters(
         select(Datapoint),
         metric_ids=_parse_metric_ids(metric_id), entity_scope=escopo,
-        period_type=tipo_periodo, filing=demonstracao,
-        period_from=period_from, period_to=period_to,
-        periodo=periodo,
+        period_type=tipo_periodo, period=periodo,
     )
     total: int = (await db.execute(select(func.count()).select_from(base_q.subquery()))).scalar_one()
     rows = (await db.execute(

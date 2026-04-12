@@ -13,6 +13,9 @@ pydantic-settings==2.13.1
 # ── File Uploads ───────────────────────────────────────────────────────────────
 python-multipart==0.0.26
 
+# ── Excel Export ───────────────────────────────────────────────────────────────
+openpyxl==3.1.5                    # XLSX generation with charts for download
+
 # ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 requests==2.32.3                   # Used by scripts/seed_data.py
