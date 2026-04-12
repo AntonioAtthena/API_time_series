@@ -7,6 +7,7 @@ Authenticated (X-API-Key header required):
 
   GET /api/v1/datapoints          Paginated list (English params) — BRAPI envelope style
   GET /api/v1/datapoints/flat     Flat array (Excel / Power Query one-click)
+                                  Supports ?format=csv for spreadsheet download
   GET /api/v1/metrics             Distinct metric_ids with counts
   GET /api/v1/filings             Distinct filing reference strings
 
@@ -16,12 +17,24 @@ Authenticated (X-API-Key header required):
 
   GET /api/v1/serie/{metric_id}   BCB SGS-style time series for a single metric
                                   → {"metric_id":…, "dados":[{"data":"dd/MM/yyyy","valor":…}]}
+                                  Supports ?format=csv for download
+
+  GET /api/v1/series              Batch: multiple metrics in a single request
+                                  ?metric_id=a,b,c  → list[SerieResponse]
+                                  Supports ?format=csv (merged spreadsheet)
+
+All endpoints that accept metric_id support comma-separated batch values:
+  ?metric_id=baixa_ativos,contingencias,total
 """
 
+import csv
+import io
+from collections import defaultdict
 from datetime import date, datetime
 from math import ceil
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,10 +60,21 @@ router = APIRouter(
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
+def _parse_metric_ids(value: str | None) -> list[str] | None:
+    """Parse a comma-separated metric_id string into a list.
+
+    Returns None if value is None, otherwise splits by comma and strips whitespace.
+    Example: 'baixa_ativos,contingencias, total' → ['baixa_ativos', 'contingencias', 'total']
+    """
+    if value is None:
+        return None
+    return [m.strip() for m in value.split(",") if m.strip()]
+
+
 def _apply_filters(
     query,
     *,
-    metric_id: str | None,
+    metric_ids: list[str] | None,
     entity_scope: str | None,
     period_type: str | None,
     filing: str | None,
@@ -58,9 +82,15 @@ def _apply_filters(
     period_to: date | None,
     periodo: str | None = None,
 ):
-    """Apply optional WHERE clauses to a SQLAlchemy select statement."""
-    if metric_id is not None:
-        query = query.where(Datapoint.metric_id == metric_id)
+    """Apply optional WHERE clauses to a SQLAlchemy select statement.
+
+    metric_ids: list of metric_id values — uses IN() for multiple, = for one.
+    """
+    if metric_ids is not None:
+        if len(metric_ids) == 1:
+            query = query.where(Datapoint.metric_id == metric_ids[0])
+        else:
+            query = query.where(Datapoint.metric_id.in_(metric_ids))
     if entity_scope is not None:
         query = query.where(Datapoint.entity_scope == entity_scope)
     if period_type is not None:
@@ -97,6 +127,20 @@ def _parse_br_date(value: str | None) -> date | None:
     )
 
 
+def _to_csv_response(rows: list[dict], filename: str) -> StreamingResponse:
+    """Serialize a list of dicts as a UTF-8 CSV download response."""
+    buf = io.StringIO()
+    if rows:
+        writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ── GET /datapoints ───────────────────────────────────────────────────────────
 
 @router.get(
@@ -106,11 +150,12 @@ def _parse_br_date(value: str | None) -> date | None:
     description=(
         "Retorna uma lista paginada de pontos de dados da série temporal. "
         "Todos os filtros são opcionais e combináveis. "
+        "**metric_id** aceita múltiplos valores separados por vírgula: `?metric_id=a,b,c`. "
         "Resposta no formato envelope BRAPI com campo **requestedAt**."
     ),
 )
 async def get_datapoints(
-    metric_id: str | None = Query(None, description="Identificador da métrica, ex: 'baixa_imobilizado'."),
+    metric_id: str | None = Query(None, description="Identificador(es) da métrica — separe por vírgula para múltiplas: 'baixa_imobilizado,contingencias'."),
     entity_scope: str | None = Query(None, description="Escopo da entidade: 'consolidado' ou 'controladora'."),
     period_type: str | None = Query(None, description="Tipo de período: 'full_year', 'quarter' ou 'year_to_date'."),
     filing: str | None = Query(None, description="Referência do demonstrativo, ex: 'DFP 2020 Ann'."),
@@ -122,7 +167,7 @@ async def get_datapoints(
 ) -> PaginatedResponse[DatapointResponse]:
     base_q = _apply_filters(
         select(Datapoint),
-        metric_id=metric_id, entity_scope=entity_scope,
+        metric_ids=_parse_metric_ids(metric_id), entity_scope=entity_scope,
         period_type=period_type, filing=filing,
         period_from=period_from, period_to=period_to,
     )
@@ -146,27 +191,37 @@ async def get_datapoints(
     summary="Todos os dados como array plano (Excel / Power Query)",
     description=(
         "Retorna os dados como array JSON simples, sem envelope de paginação. "
-        "O Power Query abre diretamente como Tabela em um clique. "
+        "**metric_id** aceita múltiplos valores separados por vírgula: `?metric_id=a,b,c`. "
+        "Use **?format=csv** para receber como planilha CSV para download direto. "
         "Limitado a 10 000 linhas."
     ),
+    responses={200: {"content": {"text/csv": {"schema": {"type": "string"}}}}},
 )
 async def get_datapoints_flat(
-    metric_id: str | None = Query(None),
+    metric_id: str | None = Query(None, description="Identificador(es) da métrica — separe por vírgula para múltiplas."),
     entity_scope: str | None = Query(None),
     period_type: str | None = Query(None),
     filing: str | None = Query(None),
     period_from: date | None = Query(None),
     period_to: date | None = Query(None),
+    format: str | None = Query(None, description="Formato de saída: 'csv' para download como planilha."),
     db: AsyncSession = Depends(get_db),
-) -> list[DatapointResponse]:
+):
     q = _apply_filters(
         select(Datapoint),
-        metric_id=metric_id, entity_scope=entity_scope,
+        metric_ids=_parse_metric_ids(metric_id), entity_scope=entity_scope,
         period_type=period_type, filing=filing,
         period_from=period_from, period_to=period_to,
     ).order_by(Datapoint.period_start, Datapoint.metric_id).limit(10_000)
     rows = (await db.execute(q)).scalars().all()
-    return [DatapointResponse.model_validate(r) for r in rows]
+    data = [DatapointResponse.model_validate(r) for r in rows]
+
+    if format == "csv":
+        return _to_csv_response(
+            [d.model_dump() for d in data],
+            filename="datapoints.csv",
+        )
+    return data
 
 
 # ── GET /metrics ──────────────────────────────────────────────────────────────
@@ -213,6 +268,7 @@ async def list_filings(db: AsyncSession = Depends(get_db)) -> list[str]:
 #   • Adds tipo_periodo (anual/trimestral/acumulado) for DFP/ITR context
 #   • Adds entidade (consolidado/controladora) — not present in macroeconomic series
 #   • Supports both ISO and Brazilian date formats (BCB only accepts DD/MM/YYYY)
+#   • Supports ?format=csv for spreadsheet download
 
 @router.get(
     "/serie/{metric_id}",
@@ -223,8 +279,10 @@ async def list_filings(db: AsyncSession = Depends(get_db)) -> list[str]:
         "`{data: 'DD/MM/YYYY', valor: float}`. "
         "Filtros opcionais: **escopo** (consolidado|controladora), "
         "**periodo** (tag bruta, ex: '12M23'), "
-        "**data_inicio** e **data_fim** nos formatos ISO ou DD/MM/AAAA."
+        "**data_inicio** e **data_fim** nos formatos ISO ou DD/MM/AAAA. "
+        "Use **?format=csv** para download como planilha."
     ),
+    responses={200: {"content": {"text/csv": {"schema": {"type": "string"}}}}},
 )
 async def get_serie(
     metric_id: str = Path(description="Identificador da métrica, ex: 'baixa_imobilizado'."),
@@ -246,14 +304,15 @@ async def get_serie(
         description="Data final — ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA).",
         examples="31/12/2024",
     ),
+    format: str | None = Query(None, description="Formato de saída: 'csv' para download como planilha."),
     db: AsyncSession = Depends(get_db),
-) -> SerieResponse:
+):
     period_from = _parse_br_date(data_inicio)
     period_to = _parse_br_date(data_fim)
 
     q = _apply_filters(
         select(Datapoint),
-        metric_id=metric_id, entity_scope=escopo,
+        metric_ids=[metric_id], entity_scope=escopo,
         period_type=None, filing=None,
         period_from=period_from, period_to=period_to,
         periodo=periodo,
@@ -284,6 +343,24 @@ async def get_serie(
         for row in rows
     ]
 
+    if format == "csv":
+        csv_rows = [
+            {
+                "metric_id": metric_id,
+                "metric_name": metric_name,
+                "data_iso": item.data_iso,
+                "data": item.data,
+                "valor": item.valor,
+                "periodo": item.periodo,
+                "tipo_periodo": item.tipo_periodo,
+                "entidade": item.entidade,
+                "moeda": "BRL",
+                "escala_monetaria": escala,
+            }
+            for item in dados
+        ]
+        return _to_csv_response(csv_rows, filename=f"serie_{metric_id}.csv")
+
     return SerieResponse(
         metric_id=metric_id,
         metric_name=metric_name,
@@ -292,6 +369,127 @@ async def get_serie(
         total=len(dados),
         dados=dados,
     )
+
+
+# ── GET /series  —  batch de múltiplas métricas ───────────────────────────────
+# BRAPI-inspired pattern: múltiplos identificadores em uma única chamada.
+# Retorna lista de SerieResponse, uma por métrica.
+# Suporta ?format=csv para planilha consolidada com todas as séries.
+
+@router.get(
+    "/series",
+    response_model=list[SerieResponse],
+    summary="Séries temporais de múltiplas métricas (batch)",
+    description=(
+        "Retorna séries temporais para uma ou mais métricas em uma única chamada. "
+        "Passe os identificadores separados por vírgula em **metric_id**: "
+        "`?metric_id=baixa_ativos,contingencias,total`. "
+        "Aceita os mesmos filtros de `/serie/{metric_id}`. "
+        "Use **?format=csv** para download de todas as séries em uma planilha única, "
+        "com coluna `metric_id` para diferenciar cada série."
+    ),
+    responses={200: {"content": {"text/csv": {"schema": {"type": "string"}}}}},
+)
+async def get_series_batch(
+    metric_id: str = Query(
+        description=(
+            "Identificadores das métricas separados por vírgula. "
+            "Ex: `baixa_ativos,contingencias,total`."
+        )
+    ),
+    escopo: str | None = Query(None, description="Escopo da entidade: 'consolidado' ou 'controladora'."),
+    periodo: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
+    data_inicio: str | None = Query(None, description="Data inicial — ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA)."),
+    data_fim: str | None = Query(None, description="Data final — ISO (AAAA-MM-DD) ou brasileiro (DD/MM/AAAA)."),
+    format: str | None = Query(None, description="Formato de saída: 'csv' para planilha consolidada."),
+    db: AsyncSession = Depends(get_db),
+):
+    metric_ids = _parse_metric_ids(metric_id)
+    if not metric_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe ao menos um metric_id.",
+        )
+
+    period_from = _parse_br_date(data_inicio)
+    period_to = _parse_br_date(data_fim)
+
+    q = _apply_filters(
+        select(Datapoint),
+        metric_ids=metric_ids, entity_scope=escopo,
+        period_type=None, filing=None,
+        period_from=period_from, period_to=period_to,
+        periodo=periodo,
+    ).order_by(Datapoint.metric_id, Datapoint.period_end, Datapoint.entity_scope)
+
+    rows = (await db.execute(q)).scalars().all()
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Nenhum dado encontrado para as métricas: {', '.join(metric_ids)}.",
+        )
+
+    # Group by metric_id preserving request order
+    grouped: dict[str, list] = defaultdict(list)
+    for row in rows:
+        grouped[row.metric_id].append(row)
+
+    result: list[SerieResponse] = []
+    csv_rows: list[dict] = []
+
+    for mid in metric_ids:
+        metric_rows = grouped.get(mid)
+        if not metric_rows:
+            continue
+
+        escala = _ESCALA_MAP.get(metric_rows[0].scale_power, f"10^{metric_rows[0].scale_power}")
+        metric_name = metric_rows[0].metric_name
+
+        dados = [
+            SerieItem(
+                data=row.period_end.strftime("%d/%m/%Y"),
+                data_iso=row.period_end,
+                valor=float(row.value),
+                periodo=row.period,
+                tipo_periodo_en=row.period_type,
+                tipo_periodo=_TIPO_PERIODO_PT.get(row.period_type or "", None),
+                entidade=row.entity_scope,
+            )
+            for row in metric_rows
+        ]
+
+        result.append(SerieResponse(
+            metric_id=mid,
+            metric_name=metric_name,
+            moeda="BRL",
+            escala_monetaria=escala,
+            total=len(dados),
+            dados=dados,
+        ))
+
+        if format == "csv":
+            for item in dados:
+                csv_rows.append({
+                    "metric_id": mid,
+                    "metric_name": metric_name,
+                    "data_iso": item.data_iso,
+                    "data": item.data,
+                    "valor": item.valor,
+                    "periodo": item.periodo,
+                    "tipo_periodo": item.tipo_periodo,
+                    "entidade": item.entidade,
+                    "moeda": "BRL",
+                    "escala_monetaria": escala,
+                })
+
+    if format == "csv":
+        slug = "_".join(metric_ids[:3])
+        if len(metric_ids) > 3:
+            slug += f"_e_mais_{len(metric_ids) - 3}"
+        return _to_csv_response(csv_rows, filename=f"series_{slug}.csv")
+
+    return result
 
 
 # ── GET /serie/{metric_id}/ponto  —  valor único ──────────────────────────────
@@ -391,12 +589,13 @@ async def get_ponto(
     description=(
         "Alias português para **/datapoints**. "
         "Aceita datas em formato brasileiro (DD/MM/AAAA) além do ISO. "
+        "**metric_id** aceita múltiplos valores separados por vírgula: `?metric_id=a,b,c`. "
         "Use **escopo** em vez de *entity_scope*, **data_inicio**/**data_fim** "
         "em vez de *period_from*/*period_to*."
     ),
 )
 async def get_dados(
-    metric_id: str | None = Query(None, description="Identificador da métrica."),
+    metric_id: str | None = Query(None, description="Identificador(es) da métrica — separe por vírgula para múltiplas."),
     escopo: str | None = Query(None, description="'consolidado' ou 'controladora'."),
     periodo: str | None = Query(None, description="Tag de período exata, ex: '12M23', '1T24'."),
     tipo_periodo: str | None = Query(None, description="'full_year', 'quarter' ou 'year_to_date'."),
@@ -412,7 +611,7 @@ async def get_dados(
 
     base_q = _apply_filters(
         select(Datapoint),
-        metric_id=metric_id, entity_scope=escopo,
+        metric_ids=_parse_metric_ids(metric_id), entity_scope=escopo,
         period_type=tipo_periodo, filing=demonstracao,
         period_from=period_from, period_to=period_to,
         periodo=periodo,
