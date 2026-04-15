@@ -101,5 +101,16 @@ async def upload_filing(
 
     # ── Ingest valid rows ─────────────────────────────────────────────────────
     response = await ingest_datapoints(validated_rows, db, file.filename or "unknown")
+    
+    try:
+        response = await ingest_datapoints(validated_rows, db, file.filename or "unknown")
+    except Exception as exc:
+        # Aqui capturamos qualquer erro de banco (IntegrityError, ConnectionError, etc.)
+        # e transformamos em um 400 ou 500 amigável para o usuário.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Erro durante a persistência no banco de dados: {str(exc)}"
+        )
+    
     response.errors = validation_errors + response.errors
     return response
