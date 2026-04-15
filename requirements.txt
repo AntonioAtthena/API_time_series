@@ -4,6 +4,7 @@ uvicorn[standard]==0.44.0
 
 # ── Database ───────────────────────────────────────────────────────────────────
 sqlalchemy==2.0.49                 # ORM; v2 required for native async support
+alembic==1.18.4                    # Schema migrations (run via start.sh before uvicorn)
 aiosqlite==0.22.1                  # Async SQLite driver (no server required)
 asyncpg==0.31.0                    # Async PostgreSQL driver (required for production)
 
