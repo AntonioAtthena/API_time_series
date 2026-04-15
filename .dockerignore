@@ -3,6 +3,21 @@
 .env.*
 !.env.example
 
+# Databases & logs
+# financial.db is a local dev artefact; production uses PostgreSQL.
+# Never bake a pre-seeded SQLite file into the image.
+*.db
+*.sqlite3
+*.log
+
+# Sample / seed data
+# Production data is loaded via POST /api/v1/upload, not baked into the image.
+time_series.json
+
+# Dev-only scripts
+# seed_data.py calls the running API from outside the container.
+scripts/seed_data.py
+
 # Python bytecode
 __pycache__/
 *.pyc
@@ -33,3 +48,6 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Claude
+.claude/

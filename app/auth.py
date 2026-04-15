@@ -17,16 +17,25 @@ Security properties:
 
 import secrets
 
-from fastapi import HTTPException, Query, Security, status
+from fastapi import HTTPException, Query, Request, Security, status
 from fastapi.security import APIKeyHeader
 
 from app.config import settings
+from app.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # The header name clients must send their key in.
 _API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
+def _mask_key(key: str) -> str:
+    """Return the first 4 characters followed by '***' for safe log output."""
+    return key[:4] + "***" if len(key) >= 4 else "***"
+
+
 async def require_api_key(
+    request: Request,
     header_key: str | None = Security(_API_KEY_HEADER),
     api_key: str | None = Query(None, alias="api_key", include_in_schema=False),
 ) -> str:
@@ -34,9 +43,22 @@ async def require_api_key(
 
     O header tem prioridade. O query param permite colar a URL direto no navegador.
     """
+    client_ip = (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
     candidate = header_key or api_key
 
     if candidate is None:
+        logger.warning(
+            "auth_failed",
+            extra={
+                "reason": "key_missing",
+                "client_ip": client_ip,
+                "path": request.url.path,
+                "method": request.method,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Chave de API ausente. Envie via header 'X-API-Key' ou parâmetro '?api_key='.",
@@ -45,8 +67,27 @@ async def require_api_key(
 
     for valid_key in settings.api_keys:
         if secrets.compare_digest(candidate, valid_key):
+            logger.debug(
+                "auth_ok",
+                extra={
+                    "masked_key": _mask_key(candidate),
+                    "client_ip": client_ip,
+                    "path": request.url.path,
+                    "method": request.method,
+                },
+            )
             return candidate
 
+    logger.warning(
+        "auth_failed",
+        extra={
+            "reason": "key_invalid",
+            "masked_key": _mask_key(candidate),
+            "client_ip": client_ip,
+            "path": request.url.path,
+            "method": request.method,
+        },
+    )
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Chave de API inválida.",

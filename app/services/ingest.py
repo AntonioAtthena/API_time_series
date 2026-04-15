@@ -27,11 +27,20 @@ from datetime import date
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Datapoint
 from app.schemas import RawDatapoint, UploadResponse
+
+# Pick the dialect-specific insert that matches the configured database.
+# Both SQLite (3.24+) and PostgreSQL (9.5+) support ON CONFLICT DO UPDATE,
+# but the Insert subclass must come from the correct dialect so SQLAlchemy
+# compiles the statement correctly against the active connection.
+if settings.database_url.startswith("sqlite"):
+    from sqlalchemy.dialects.sqlite import insert as _dialect_insert
+else:
+    from sqlalchemy.dialects.postgresql import insert as _dialect_insert
 
 
 # ── Period parsing ────────────────────────────────────────────────────────────
@@ -164,10 +173,10 @@ async def ingest_datapoints(
         if (r["metric_id"], r["period"], r["entity_scope"], r["file"]) in pre_existing
     )
 
-    # SQLite upsert: INSERT … ON CONFLICT(unique columns) DO UPDATE SET …
+    # Upsert: INSERT … ON CONFLICT(unique columns) DO UPDATE SET …
     # index_elements must match the four columns in the UniqueConstraint.
     # created_at is excluded so the original insertion timestamp is preserved.
-    stmt = sqlite_insert(Datapoint).values(records)
+    stmt = _dialect_insert(Datapoint).values(records)
     upsert_stmt = stmt.on_conflict_do_update(
         index_elements=["metric_id", "period", "entity_scope", "file"],
         set_={

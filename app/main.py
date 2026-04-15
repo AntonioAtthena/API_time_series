@@ -15,20 +15,27 @@ import json
 import pathlib
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
-from datetime import datetime
+from datetime import date, datetime, timezone
 
-from fastapi import FastAPI, Depends
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import require_api_key
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine, get_db
+from app.logging_config import get_logger, setup_logging
+from app.middleware import RateLimitMiddleware, RequestLoggingMiddleware
 from app.models import Datapoint
 from app.routers import datapoints, upload
-from app.schemas import DatapointResponse, InfoResponse, RawDatapoint
+from app.schemas import DatapointResponse, InfoResponse, PrivacidadeResponse, RawDatapoint
 from app.services.ingest import ingest_datapoints
+
+# Initialise logging before anything else so that startup messages are captured.
+setup_logging(env=settings.env)
+logger = get_logger(__name__)
 
 
 async def _auto_seed() -> None:
@@ -55,17 +62,50 @@ async def _auto_seed() -> None:
 
         if validated:
             result = await ingest_datapoints(validated, db, seed_file.name)
-            print(f"==> Auto-seeded {result.inserted} rows from {seed_file.name}")
+            logger.info(
+                "auto_seed_complete",
+                extra={"inserted": result.inserted, "file": seed_file.name},
+            )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Create tables on startup; seed DB if empty; dispose connection pool on shutdown."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Initialise the database, seed if empty, then dispose the pool on shutdown.
+
+    Schema strategy:
+      SQLite (local dev)  — create_all runs automatically so no migration tool
+                            is needed to start the app locally.
+      PostgreSQL (Docker / production) — schema is owned exclusively by Alembic.
+                            start.sh runs `alembic upgrade head` before this
+                            lifespan executes, so create_all must NOT run or it
+                            will silently bypass the migration history and can
+                            leave the schema in an inconsistent state.
+    """
+    logger.info("startup", extra={"env": settings.env, "database_url": settings.database_url.split("///")[0]})
+
+    if settings.env != "development" and "dev-api-key-change-me" in settings.api_keys:
+        logger.error(
+            "insecure_default_api_key",
+            extra={
+                "env": settings.env,
+                "detail": (
+                    "A chave de API padrão 'dev-api-key-change-me' não pode ser usada "
+                    "fora do ambiente de desenvolvimento. "
+                    "Defina a variável de ambiente API_KEYS com uma chave segura antes de iniciar. "
+                    "Gere uma: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+                ),
+            },
+        )
+        raise RuntimeError("Default API key must not be used in production")
+
+    if settings.database_url.startswith("sqlite"):
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
     await _auto_seed()
+    logger.info("ready")
     yield
     await engine.dispose()
+    logger.info("shutdown")
 
 
 app = FastAPI(
@@ -87,6 +127,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Middleware is applied in reverse registration order (last added = outermost).
+# Desired order: RateLimit → RequestLogging → CORSMiddleware → route handler.
+# So register them in reverse: CORS first, then RequestLogging, then RateLimit.
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if settings.env == "development" else [],
@@ -95,28 +139,40 @@ app.add_middleware(
     allow_headers=["X-API-Key", "Content-Type"],
 )
 
+app.add_middleware(RequestLoggingMiddleware)
+
+if settings.rate_limit_per_minute > 0:
+    app.add_middleware(
+        RateLimitMiddleware,
+        calls_per_minute=settings.rate_limit_per_minute,
+        upload_calls_per_minute=settings.rate_limit_upload_per_minute,
+    )
+
 app.include_router(datapoints.router)
 app.include_router(upload.router)
 
 
 # ── GET / ─────────────────────────────────────────────────────────────────────
-# Flat array, no auth — paste directly into Excel Power Query.
+# Flat array — Excel / Power Query shortcut.  Requires API key.
 
 @app.get(
     "/",
     response_model=list[DatapointResponse],
     tags=["Dados Financeiros"],
-    summary="Todos os dados — array plano (sem autenticação)",
+    summary="Todos os dados — array plano (requer autenticação)",
     description=(
-        "Retorna todos os registros como array JSON simples, ordenado por "
-        "**period_start**. Sem necessidade de API key. \n\n"
+        "Retorna até 10 000 registros como array JSON simples, ordenado por "
+        "**period_start**. Requer header `X-API-Key` ou parâmetro `?api_key=`.\n\n"
         "Cole esta URL diretamente no Excel: "
-        "**Dados → Obter Dados → De Web** → `http://localhost:8000/`"
+        "**Dados → Obter Dados → De Web → Avançado** → `http://localhost:8000/?api_key=<SUA_CHAVE>`"
     ),
+    dependencies=[Depends(require_api_key)],
 )
 async def get_all(db: AsyncSession = Depends(get_db)) -> list[DatapointResponse]:
     result = await db.execute(
-        select(Datapoint).order_by(Datapoint.period_start, Datapoint.metric_id)
+        select(Datapoint)
+        .order_by(Datapoint.period_start, Datapoint.metric_id)
+        .limit(10_000)
     )
     return [DatapointResponse.model_validate(row) for row in result.scalars().all()]
 
@@ -137,7 +193,7 @@ async def get_all(db: AsyncSession = Depends(get_db)) -> list[DatapointResponse]
         "**Não requer autenticação.**"
     ),
 )
-async def info(db: AsyncSession = Depends(get_db)) -> InfoResponse:
+async def info(db: AsyncSession = Depends(get_db)) -> InfoResponse:  # noqa: F811
     # Single aggregate query for counts and date bounds
     agg = (await db.execute(
         select(
@@ -173,5 +229,101 @@ async def info(db: AsyncSession = Depends(get_db)) -> InfoResponse:
         periodo_final=agg.fim,
         escopos_disponiveis=scopes,
         moeda="BRL",
-        requestedAt=datetime.now(),
+        requestedAt=datetime.now(timezone.utc),
     )
+
+
+# ── GET /privacidade ──────────────────────────────────────────────────────────
+# LGPD Art. 9º: data subjects must be able to access clear information about
+# how their personal data is processed.  This endpoint provides that disclosure
+# in a machine-readable form so compliance tools and API clients can inspect it
+# programmatically.  No authentication required — this is a public legal notice.
+
+@app.get(
+    "/privacidade",
+    response_model=PrivacidadeResponse,
+    tags=["Compliance"],
+    summary="Aviso de privacidade (LGPD)",
+    description=(
+        "Retorna o aviso de privacidade estruturado conforme a **Lei Geral de "
+        "Proteção de Dados — Lei nº 13.709/2018**. "
+        "Descreve quais dados pessoais são coletados, a finalidade, a base legal, "
+        "o prazo de retenção e os direitos do titular. "
+        "**Não requer autenticação.**"
+    ),
+)
+async def privacidade() -> PrivacidadeResponse:
+    from app.schemas import DadoPessoalColetado
+    retencao_logs = f"{settings.lgpd_retencao_logs_dias} dias"
+    contato = settings.lgpd_encarregado_email or "Não configurado — defina LGPD_ENCARREGADO_EMAIL"
+    return PrivacidadeResponse(
+        controlador=settings.lgpd_responsavel,
+        encarregado_email=contato,
+        dados_pessoais_coletados=[
+            DadoPessoalColetado(
+                dado="Endereço IP do cliente",
+                finalidade=(
+                    "Segurança da informação, controle de acesso, "
+                    "limitação de taxa de requisições (rate limiting) e "
+                    "prevenção de abusos."
+                ),
+                base_legal="Art. 7º, IX LGPD — legítimo interesse do controlador",
+                retencao=f"Logs de acesso retidos por {retencao_logs} na camada de infraestrutura, "
+                         "após o que são excluídos automaticamente.",
+            ),
+        ],
+        direitos_do_titular=[
+            "Confirmação da existência de tratamento (Art. 18, I)",
+            "Acesso aos dados (Art. 18, II)",
+            "Correção de dados incompletos ou inexatos (Art. 18, III)",
+            "Anonimização, bloqueio ou eliminação de dados desnecessários (Art. 18, IV)",
+            "Portabilidade dos dados (Art. 18, V)",
+            "Eliminação dos dados tratados com consentimento (Art. 18, VI)",
+            "Informação sobre compartilhamento com terceiros (Art. 18, VII)",
+            "Revogação do consentimento (Art. 18, IX)",
+        ],
+        contato_para_solicitacoes=contato,
+        aviso=(
+            "Os endereços IP são registrados em logs de acesso gerenciados pela "
+            "infraestrutura de hospedagem. O prazo de retenção é configurável via "
+            "a variável de ambiente LGPD_RETENCAO_LOGS_DIAS (padrão: "
+            f"{settings.lgpd_retencao_logs_dias} dias). "
+            "Esta API não coleta, armazena nem compartilha quaisquer outros dados "
+            "pessoais dos usuários."
+        ),
+        atualizado_em=date(2026, 4, 15),
+    )
+
+
+# ── GET /health ───────────────────────────────────────────────────────────────
+# Liveness probe: always returns 200 while the process is running.
+# Used by Docker/Kubernetes to decide whether to restart the container.
+
+@app.get(
+    "/health",
+    tags=["Sistema"],
+    summary="Liveness probe",
+    description="Retorna 200 enquanto o processo estiver rodando. Usado por orquestradores (Docker, Kubernetes) para checar se o contêiner deve ser reiniciado.",
+)
+async def health() -> dict:
+    return {"status": "ok"}
+
+
+# ── GET /readiness ────────────────────────────────────────────────────────────
+# Readiness probe: confirms the process is ready to serve traffic by
+# executing a cheap SELECT against the database.
+
+@app.get(
+    "/readiness",
+    tags=["Sistema"],
+    summary="Readiness probe",
+    description="Verifica se o banco de dados está acessível. Retorna 200 se pronto para receber tráfego, 503 se o banco estiver indisponível.",
+)
+async def readiness(db: AsyncSession = Depends(get_db)) -> dict:
+    from sqlalchemy import text
+    try:
+        await db.execute(text("SELECT 1"))
+    except Exception as exc:
+        logger.error("readiness_check_failed", extra={"error": str(exc)})
+        raise HTTPException(status_code=503, detail="Banco de dados indisponível.")
+    return {"status": "ready"}

@@ -7,7 +7,7 @@ Conventions follow the main Brazilian financial market APIs:
   - BRAPI (brapi.dev): results envelope with requestedAt timestamp
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
@@ -211,7 +211,7 @@ class PaginatedResponse(BaseModel, Generic[T]):
     page_size: int
     total: int
     total_pages: int
-    requestedAt: datetime = Field(default_factory=datetime.now)
+    requestedAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ── Metric summary ────────────────────────────────────────────────────────────
@@ -272,3 +272,51 @@ class UploadResponse(BaseModel):
     inserted: int
     updated: int
     errors: list[str] = Field(default_factory=list)
+
+
+# ── LGPD privacy notice schemas ───────────────────────────────────────────────
+# Returned by GET /privacidade.
+# Structured so that compliance tools and clients can parse the notice
+# programmatically, not just display it as prose.
+
+class DadoPessoalColetado(BaseModel):
+    """One category of personal data collected by the API.
+
+    Attributes:
+        dado:        What is collected (e.g. 'Endereço IP').
+        finalidade:  Why it is collected.
+        base_legal:  LGPD legal basis (Art. 7º reference).
+        retencao:    How long it is kept before deletion.
+    """
+
+    dado: str
+    finalidade: str
+    base_legal: str
+    retencao: str
+
+
+class PrivacidadeResponse(BaseModel):
+    """LGPD-compliant privacy notice returned by GET /privacidade.
+
+    Structured to satisfy Art. 9º LGPD (transparency about processing)
+    and to serve as machine-readable documentation for compliance audits.
+
+    Attributes:
+        lei:                        Governing legislation reference.
+        controlador:                Legal name of the data controller.
+        encarregado_email:          DPO contact address (Art. 41 LGPD).
+        dados_pessoais_coletados:   Itemised list of personal data categories processed.
+        direitos_do_titular:        Data-subject rights available under Art. 18 LGPD.
+        contato_para_solicitacoes:  Channel for exercising data-subject rights.
+        aviso:                      Free-text note about infrastructure-level retention.
+        atualizado_em:              Date this notice was last revised.
+    """
+
+    lei: str = "Lei Geral de Proteção de Dados — Lei nº 13.709/2018"
+    controlador: str
+    encarregado_email: str
+    dados_pessoais_coletados: list[DadoPessoalColetado]
+    direitos_do_titular: list[str]
+    contato_para_solicitacoes: str
+    aviso: str
+    atualizado_em: date
