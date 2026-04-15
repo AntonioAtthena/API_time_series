@@ -11,6 +11,10 @@ RUN groupadd --gid 1001 appgroup \
 # Set working directory (owned by root at this point — changed below)
 WORKDIR /app
 
+# Ensure the project root is always on sys.path so `from app.*` imports
+# work regardless of how the container is invoked (Railway may not preserve CWD).
+ENV PYTHONPATH=/app
+
 # Install system dependencies needed to compile asyncpg (C extension).
 # Removed in the same layer to keep the image lean.
 RUN apt-get update && apt-get install -y --no-install-recommends \
