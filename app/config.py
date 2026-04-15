@@ -30,6 +30,18 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./financial.db"
     api_keys: list[str] = ["dev-api-key-change-me"]
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def coerce_async_driver(cls, v: Any) -> str:
+        """Railway (and most PaaS) inject DATABASE_URL as 'postgresql://…'.
+        SQLAlchemy's async engine requires 'postgresql+asyncpg://…'.
+        This validator silently upgrades the scheme so the app works out-of-the-box
+        on Railway without manual URL editing.
+        """
+        if isinstance(v, str) and v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
     env: str = "development"
 
     # Rate limiting — requests per minute per client IP.
