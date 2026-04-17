@@ -29,7 +29,19 @@ class Settings(BaseSettings):
     )
 
     database_url: str = "sqlite+aiosqlite:///./financial.db"
-    api_keys: list[str] = ["dev-api-key-change-me"]
+    api_keys: str = "dev-api-key-change-me"
+
+    @property
+    def api_keys_list(self) -> list[str]:
+        """Parse comma-separated or JSON-array API_KEYS env var into a list."""
+        v = self.api_keys.strip()
+        if v.startswith("["):
+            import json
+            try:
+                return [k.strip() for k in json.loads(v) if k.strip()]
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return [k.strip() for k in v.split(",") if k.strip()]
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -63,20 +75,6 @@ class Settings(BaseSettings):
     lgpd_encarregado_email: str = ""
     lgpd_retencao_logs_dias: int = 90
 
-    @field_validator("api_keys", mode="before")
-    @classmethod
-    def parse_api_keys(cls, v: Any) -> list[str]:
-        """Accept either a JSON array or a comma-separated string.
-
-        Args:
-            v: Raw value from the environment variable.
-
-        Returns:
-            List of non-empty, stripped API key strings.
-        """
-        if isinstance(v, str):
-            return [k.strip() for k in v.split(",") if k.strip()]
-        return v
 
 
 # Module-level singleton — import this everywhere instead of re-instantiating.

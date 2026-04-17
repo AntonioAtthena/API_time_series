@@ -65,7 +65,7 @@ async def require_api_key(
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    for valid_key in settings.api_keys:
+    for valid_key in settings.api_keys_list:
         if secrets.compare_digest(candidate, valid_key):
             logger.debug(
                 "auth_ok",
