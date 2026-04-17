@@ -39,7 +39,7 @@ RUN chmod +x scripts/start.sh \
 USER appuser
 
 # Expose the application port
-EXPOSE 8000
+EXPOSE 8080
 
 # Run migrations then start the ASGI server
 CMD ["scripts/start.sh"]
