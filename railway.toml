@@ -1,9 +1,8 @@
 [build]
-builder = "dockerfile"
+builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "scripts/start.sh"
 healthcheckPath = "/health"
-healthcheckTimeout = 30
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 3
+healthcheckTimeout = 60
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
